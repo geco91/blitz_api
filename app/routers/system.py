@@ -45,6 +45,7 @@ async def login(i: LoginInput):
     platform = ""
     try:
         platform = config("platform", cast=str)
+        logging.info(f"LOGIN: platform({platform})")
     except:
         logging.warning(f"please set platform in env config file")
 
@@ -57,6 +58,12 @@ async def login(i: LoginInput):
             data = parse_key_value_text(result)
             if data["correct"] == "1":
                 return sign_jwt()
+            else:
+                logging.warning(f"LOGIN: password failed system check")
+                logging.warning(f"data['error']({data['error']})")
+                #logging.debug(f"data['runningUser']({data['runningUser']})")
+        else:
+            logging.warning(f"LOGIN: password failed basic valid check")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Password is wrong")
     else:
         match = secrets.compare_digest(i.password, config("login_password", cast=str))
