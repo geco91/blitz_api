@@ -37,8 +37,8 @@ async def get_status():
     message = await redis_get("message")
     if setupPhase == "done":
         try:
-            blitz_sync_initial_done = await redis_get("blitz_sync_initial_done")
-            if blitz_sync_initial_done == "1":
+            blitz_default_sync_initial_done = await redis_get("blitz_default_sync_initial_done")
+            if blitz_default_sync_initial_done == "1":
                 initialsync = "done"
             else:
                 initialsync = "running"  
@@ -299,8 +299,8 @@ async def setup_sync_info():
         return HTTPException(status.HTTP_405_METHOD_NOT_ALLOWED)
 
     try:
-        blitz_sync_initial_done = await redis_get("blitz_sync_initial_done")
-        if blitz_sync_initial_done == "1":
+        blitz_default_sync_initial_done = await redis_get("blitz_default_sync_initial_done")
+        if blitz_default_sync_initial_done == "1":
             initialsync = "done"
         else:
             initialsync = "running"
