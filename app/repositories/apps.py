@@ -147,11 +147,13 @@ async def run_bonus_script(app_id: str, params: str):
     logging.info(f"[{cmd!r} exited with {proc.returncode}]")
 
     # logging to console
-    logging.warning(f"INSTALL RESULT: cmd({id}) params:{params}")
+    logging.warning(f"INSTALL RESULT: cmd({cmd})")
+    # log stdout
     if stdout:
         logging.info(f"[stdout]\n{stdout.decode()}")
     else:
         logging.error(f"NO [stdout]")
+    # log stderr
     if stderr:
         logging.error(f"[stderr]\n{stderr.decode()}")
     else:
