@@ -40,7 +40,8 @@ if [ "$?" != "0" ]; then
 fi
 
 local=.
-remote=admin@$localIP:/root/blitz_api
+remoteRepoPath="/home/blitzapi/blitz_api"
+remote="admin@$localIP:${remoteRepoPath}"
 
 # clean pycache just in case the code was compiled locally before
 echo "# local cache delete .."
@@ -55,9 +56,8 @@ rm -r ./app/repositories/__pycache__ 2>/dev/null
 rm -r ./app/routers/__pycache__ 2>/dev/null
 rm -r ./app/auth/__pycache__ 2>/dev/null
 
-# Needs sshpass installed
-echo "# syncing local code to: ${remote}"
-sshpass -p "$passwordA" rsync -rvz --exclude .git/ -e "ssh -p ${sshPort}" $local $remote
+# make sure remote repo files can be overwritten bei user admin
+sshpass -p "$passwordA" ssh -p $sshPort admin@$localIP "sudo chown -R admin:admin ${remoteRepoPath}"
 result=$?
 echo "result(${result})"
 if [ "$result" != "0" ]; then
@@ -66,6 +66,20 @@ if [ "$result" != "0" ]; then
     echo "SSH in once manually. Then try again."
     exit 1
 fi
+
+# Needs sshpass installed
+echo "# syncing local code to: ${remote}"
+sshpass -p "$passwordA" rsync -rvz --exclude .git/ -e "ssh -p ${sshPort}" $local $remote
+result=$?
+echo "result(${result})"
+if [ "$result" != "0" ]; then
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "FAIL: was not able to rsync"
+    exit 1
+fi
+
+# make sure uploaded/synced files belog again to the correct raspiblitz user to run
+sshpass -p "$passwordA" ssh -p $sshPort admin@$localIP "sudo chown -R blitzapi:blitzapi ${remoteRepoPath}"
 
 # Restart the blitz service to activate changes
 echo "# restarting blitzapi.service"

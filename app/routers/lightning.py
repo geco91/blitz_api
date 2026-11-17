@@ -42,8 +42,10 @@ from app.repositories.lightning import (
 from app.routers.lightning_docs import (
     get_balance_response_desc,
     new_address_desc,
+    open_channel_desc,
     send_coins_desc,
     send_payment_desc,
+    unlock_wallet_desc,
 )
 
 _PREFIX = "lightning"
@@ -51,7 +53,9 @@ _PREFIX = "lightning"
 router = APIRouter(prefix=f"/{_PREFIX}", tags=["Lightning"])
 
 responses = {
-    423: {"description": "Wallet is locked. Unlock via /lightning/unlock-wallet"}
+    423: {
+        "description": "LND only: Wallet is locked. Unlock via /lightning/unlock-wallet."
+    }
 }
 
 
@@ -65,7 +69,12 @@ responses = {
     responses=responses,
 )
 async def addinvoice(
-    value_msat: int, memo: str = "", expiry: int = 3600, is_keysend: bool = False
+    value_msat: int = Query(description="The amount of msat of the invoice", ge=0),
+    memo: str = Query("", description="The memo of the invoice"),
+    expiry: int = Query(3600, description="Expiry time in seconds"),
+    is_keysend: bool = Query(
+        False, description="LND only: Whether this invoice is a keysend invoice."
+    ),
 ):
     try:
         return await add_invoice(memo, value_msat, expiry, is_keysend)
@@ -126,7 +135,7 @@ async def get_fee_revenue_path() -> FeeRevenue:
     responses=responses,
 )
 async def list_all_tx_path(
-    successfull_only: bool = Query(
+    successful_only: bool = Query(
         False,
         description="If set, only successful transaction will be returned in the response.",
     ),
@@ -144,7 +153,7 @@ async def list_all_tx_path(
     ),
 ):
     try:
-        return await list_all_tx(successfull_only, index_offset, max_tx, reversed)
+        return await list_all_tx(successful_only, index_offset, max_tx, reversed)
     except HTTPException as r:
         raise
     except NotImplementedError as r:
@@ -273,7 +282,10 @@ async def new_address_path(input: NewAddressInput):
     response_description="Either an error or a SendCoinsResponse object on success",
     dependencies=[Depends(JWTBearer())],
     response_model=SendCoinsResponse,
-    responses=responses,
+    responses={
+        412: {"description": "When not enough funds are available."},
+        423: responses[423],
+    },
 )
 async def send_coins_path(input: SendCoinsInput):
     try:
@@ -288,12 +300,18 @@ async def send_coins_path(input: SendCoinsInput):
     "/open-channel",
     name=f"{_PREFIX}.open-channel",
     summary="open a new lightning channel",
-    description="For additional information see [LND docs](https://api.lightning.community/#openchannel)",
+    description=open_channel_desc,
     dependencies=[Depends(JWTBearer())],
     response_model=str,
-    responses=responses,
+    responses={
+        412: {"description": "When not enough funds are available."},
+        423: responses[423],
+        504: {"description": "When the peer is not reachable."},
+    },
 )
-async def channelopen(local_funding_amount: int, node_URI: str, target_confs: int = 3):
+async def open_channel_path(
+    local_funding_amount: int, node_URI: str, target_confs: int = 3
+):
     try:
         return await channel_open(local_funding_amount, node_URI, target_confs)
     except HTTPException as r:
@@ -305,15 +323,15 @@ async def channelopen(local_funding_amount: int, node_URI: str, target_confs: in
 
 
 @router.get(
-    "/list-channel",
-    name=f"{_PREFIX}.list-channel",
+    "/list-channels",
+    name=f"{_PREFIX}.list-channels",
     summary="Returns a list of open channels",
     response_model=List[Channel],
     response_description="A list of all open channels.",
     dependencies=[Depends(JWTBearer())],
     responses=responses,
 )
-async def channellist():
+async def list_channels_path():
     try:
         return await channel_list()
     except HTTPException as r:
@@ -326,14 +344,14 @@ async def channellist():
 
 @router.post(
     "/close-channel",
-    name=f"{_PREFIX}.channel-close",
+    name=f"{_PREFIX}.close-channel",
     summary="close a channel",
     description="For additional information see [LND docs](https://api.lightning.community/#closechannel)",
     dependencies=[Depends(JWTBearer())],
     response_model=str,
     responses=responses,
 )
-async def channelclose(channel_id: str, force_close: bool):
+async def close_channel_path(channel_id: str, force_close: bool):
     try:
         return await channel_close(channel_id, force_close)
     except HTTPException as r:
@@ -361,7 +379,9 @@ Possible error messages:
 * amount must not be specified when paying a non-zero amount invoice
 """
         },
-        409: {"description": "When attempting to pay an already paid invoice."},
+        409: {
+            "description": "[LND only] When attempting to pay an already paid invoice. CLN will return the payment object of the previously paid invoice. Info: [GitHub](https://github.com/fusion44/blitz_api/issues/131)",
+        },
         423: responses[423],
     },
 )
@@ -440,7 +460,7 @@ async def get_decode_pay_request(
     name=f"{_PREFIX}.unlock-wallet",
     summary="Unlocks a locked wallet.",
     response_model=bool,
-    response_description="True if ok, False otherwise",
+    response_description=unlock_wallet_desc,
     dependencies=[Depends(JWTBearer())],
     responses={
         401: {
