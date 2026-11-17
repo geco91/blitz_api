@@ -1,12 +1,17 @@
 import asyncio
 import re
-from os import path
 
 from decouple import config
 from fastapi import HTTPException, Request, status
 
 from app.models.system import APIPlatform, ConnectionInfo, RawDebugLogData, SystemInfo
-from app.utils import SSE, call_script, parse_key_value_text, send_sse_message
+from app.utils import (
+    SSE,
+    broadcast_sse_msg,
+    call_script,
+    call_sudo_script,
+    parse_key_value_text,
+)
 
 PLATFORM = config("platform", default=APIPlatform.RASPIBLITZ)
 if PLATFORM == APIPlatform.RASPIBLITZ:
@@ -32,20 +37,6 @@ elif PLATFORM == APIPlatform.NATIVE_PYTHON:
 else:
     raise RuntimeError(f"Unknown platform {PLATFORM}")
 
-SHELL_SCRIPT_PATH = config("shell_script_path")
-GET_DEBUG_LOG_SCRIPT = path.join(SHELL_SCRIPT_PATH, "config.scripts", "blitz.debug.sh")
-
-
-def _check_shell_scripts_status():
-    if not path.exists(SHELL_SCRIPT_PATH):
-        raise Exception(f"invalid shell script path: {SHELL_SCRIPT_PATH}")
-
-    if not path.isfile(GET_DEBUG_LOG_SCRIPT):
-        raise Exception(f"Required file does not exist: {GET_DEBUG_LOG_SCRIPT}")
-
-
-_check_shell_scripts_status()
-
 
 def password_valid(password: str):
     if len(password) < 8:
@@ -70,7 +61,7 @@ async def password_change(type: str, old_password: str, new_password: str):
     if not type in ["a", "b", "c"]:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="unknown password type")
 
-    # check password formattings
+    # check password formatting
     if not password_valid(old_password):
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, detail="old password format invalid"
@@ -93,13 +84,13 @@ async def password_change(type: str, old_password: str, new_password: str):
             )
 
         # second set new password
-        scriptcall = (
+        script_call = (
             f'/home/admin/config.scripts/blitz.passwords.sh set {type} "{new_password}"'
         )
         if type == "c":
             # will set password c of both lnd & core lightning if installed/activated
-            scriptcall = f'/home/admin/config.scripts/blitz.passwords.sh set c "{old_password}" "{new_password}"'
-        result = await call_script(scriptcall)
+            script_call = f'/home/admin/config.scripts/blitz.passwords.sh set c "{old_password}" "{new_password}"'
+        result = await call_sudo_script(script_call)
         data = parse_key_value_text(result)
         print(str(data))
         if "error" in data.keys() and len(data["error"]) > 0:
@@ -132,9 +123,9 @@ async def get_connection_info() -> ConnectionInfo:
 
 async def shutdown(reboot: bool) -> bool:
     if reboot:
-        await send_sse_message(SSE.SYSTEM_REBOOT_NOTICE, {"reboot": True})
+        await broadcast_sse_msg(SSE.SYSTEM_REBOOT_NOTICE, {"reboot": True})
     else:
-        await send_sse_message(SSE.SYSTEM_SHUTDOWN_NOTICE, {"shutdown": True})
+        await broadcast_sse_msg(SSE.SYSTEM_SHUTDOWN_NOTICE, {"shutdown": True})
 
     return await shutdown_impl(reboot=reboot)
 
@@ -181,7 +172,7 @@ async def _handle_gather_hardware_info():
     while True:
         info = await get_hardware_info()
         if last_info != info:
-            await send_sse_message(SSE.HARDWARE_INFO, info)
+            await broadcast_sse_msg(SSE.HARDWARE_INFO, info)
             last_info = info
 
         await asyncio.sleep(HW_INFO_YIELD_TIME)

@@ -1,3 +1,13 @@
+add_invoice_desc = """
+Adds a new invoice to the database.
+
+LND is generating a unique auto-incrementing `add_index` for the invoice.
+
+CLN will receive a [Firebase-like PushID](https://firebase.blog/posts/2015/02/the-2120-ways-to-ensure-unique_68) from the backend for the `label` when creating the invoice.
+
+Please refer to the response schema docs for more information.
+"""
+
 get_balance_response_desc = """
 A JSON String with on chain wallet balances with on-chain balances in
 **sat** and channel balances in **msat**. Detailed description is in
@@ -30,4 +40,34 @@ send_payment_desc = """
 This endpoints attempts to pay a payment request.
 
 Intermediate status updates will be sent via the SSE channel. This endpoint returns the last success or error message from the node.
+"""
+
+open_channel_desc = """
+__open-channel__ attempts to open a channel with a peer.
+
+### LND:
+_target_conf_: The target number of blocks that the funding transaction should be confirmed by.
+
+### c-lightning:
+* Set _target_conf_ ==1: interpreted as urgent (aim for next block)
+* Set _target_conf_ >=2: interpreted as normal (next 4 blocks or so, **default**)
+* Set _target_cont_ >=10: interpreted as slow (next 100 blocks or so)
+
+> 👉 See [https://lightning.readthedocs.io/lightning-txprepare.7.html](https://lightning.readthedocs.io/lightning-txprepare.7.html)
+"""
+
+unlock_wallet_desc = """
+`True` if ok, `False` otherwise
+
+### LND:
+This call will wait until the LND daemon is fully ready to accept calls. Internally it'll call GetInfo every
+0.1 seconds and returns True for the first successful call.
+
+> ℹ️ _After the unlock the LND-gRPC server takes a bit of time to boot up._
+
+### Core Lightning:
+
+> ℹ️ _Platform: Native_ CLN doesn't support wallet locking and will return True immediately.
+
+> ℹ️ _Platform: RaspiBlitz_ RaspiBlitz has its own locking implementation on top of CLN. Will unlock and return True if successful. Might take a few seconds. If it takes longer than 60 seconds it'll return an error.
 """

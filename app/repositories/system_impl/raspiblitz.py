@@ -5,49 +5,62 @@ import os
 from decouple import config
 
 from app.constants import API_VERSION
-from app.models.system import (
-    APIPlatform,
-    ConnectionInfo,
-    HealthMessage,
-    HealthMessagePriority,
-    HealthState,
-    SystemInfo,
-)
+from app.models.system import APIPlatform, ConnectionInfo, SystemInfo
 from app.repositories.lightning import get_ln_info
 from app.utils import (
     SSE,
+    broadcast_sse_msg,
     call_script,
     parse_key_value_text,
     redis_get,
-    send_sse_message,
 )
 
 SHELL_SCRIPT_PATH = config("shell_script_path")
+GET_DEBUG_LOG_SCRIPT = os.path.join(
+    SHELL_SCRIPT_PATH, "config.scripts", "blitz.debug.sh"
+)
+
+
+def _check_shell_scripts_status():
+    if not os.path.exists(SHELL_SCRIPT_PATH):
+        raise Exception(f"invalid shell script path: {SHELL_SCRIPT_PATH}")
+
+    if not os.path.isfile(GET_DEBUG_LOG_SCRIPT):
+        raise Exception(f"Required file does not exist: {GET_DEBUG_LOG_SCRIPT}")
+
+
+_check_shell_scripts_status()
 
 
 async def get_system_info_impl() -> SystemInfo:
-    lninfo = await get_ln_info()
+
+    lightning = await redis_get("lightning")
+    if lightning == "" or lightning == "none":
+        data_chain = await redis_get("chain")
+        data_chain = f"{data_chain}net"
+        data_alias = await redis_get("hostname")
+        data_color = "#FF9900"
+    else:
+        lninfo = await get_ln_info()
+        data_chain = lninfo.chains[0].network
+        data_alias = lninfo.alias
+        data_color = lninfo.color
+
     lan = await redis_get("internet_localip")
     tor = await redis_get("tor_web_addr")
 
     return SystemInfo(
-        alias=lninfo.alias,
-        color=lninfo.color,
+        alias=data_alias,
+        color=data_color,
         platform=APIPlatform.RASPIBLITZ,
         platform_version=await redis_get("raspiBlitzVersion"),
         api_version=API_VERSION,
-        health=HealthState.ATTENTION_REQUIRED,
-        health_messages=[
-            HealthMessage(
-                id=25, level=HealthMessagePriority.WARNING, message="HDD 85% full"
-            )
-        ],
         tor_web_ui=tor,
         tor_api=f"{tor}/api",
         lan_web_ui=f"http://{lan}/",
         lan_api=f"http://{lan}/api",
         ssh_address=f"admin@{lan}",
-        chain=lninfo.chains[0].network,
+        chain=data_chain,
     )
 
 
@@ -76,9 +89,9 @@ async def shutdown_impl(reboot: bool) -> bool:
     if proc.returncode > 0:
         err = stderr.decode()
         if reboot:
-            await send_sse_message(SSE.SYSTEM_REBOOT_ERROR, {"error_message": err})
+            await broadcast_sse_msg(SSE.SYSTEM_REBOOT_ERROR, {"error_message": err})
         else:
-            await send_sse_message(SSE.SYSTEM_SHUTDOWN_ERROR, {"error_message": err})
+            await broadcast_sse_msg(SSE.SYSTEM_SHUTDOWN_ERROR, {"error_message": err})
 
         return False
 
@@ -135,7 +148,7 @@ async def get_connection_info_impl() -> ConnectionInfo:
     data_cl_rest_macaroon = ""
     data_cl_rest_onion = ""
     if lightning == "cl":
-        key_value_text = await call_script(
+        key_value_text = await call_sudo_script(
             "/home/admin/config.scripts/cl.rest.sh connect mainnet key-value"
         )
         key_value = parse_key_value_text(key_value_text)

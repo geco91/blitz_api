@@ -10,9 +10,11 @@ from fastapi import HTTPException, status
 from fastapi.encoders import jsonable_encoder
 
 from app.constants import available_app_ids
-from app.utils import SSE, call_script, parse_key_value_text, send_sse_message
+from app.utils import SSE, broadcast_sse_msg, call_sudo_script, parse_key_value_text
 
 SHELL_SCRIPT_PATH = config("shell_script_path")
+
+node_type = config("ln_node")
 
 
 async def get_app_status_single(app_iD):
@@ -28,7 +30,7 @@ async def get_app_status_single(app_iD):
     )
 
     try:
-        result = await call_script(script_call)
+        result = await call_sudo_script(script_call)
     except:
         # script had error or was not able to deliver all requested data fields
         logging.warning(f"error on calling: {script_call}")
@@ -105,7 +107,23 @@ async def get_app_status_single(app_iD):
 async def get_app_status():
     appStatusList: Array = []
     for appID in available_app_ids:
+
+        # skip app based on node running
+        if node_type == "" or node_type == "none":
+            if appID == "rtl":
+                continue
+            if appID == "lnbits":
+                continue
+            if appID == "thunderhub":
+                continue
+        elif node_type == "cln_grpc":
+            if appID == "thunderhub":
+                continue
+        # elif node_type="lnd_grpc":
+
+        # get status (installed, etc) and append
         appStatusList.append(await get_app_status_single(appID))
+
     return appStatusList
 
 
@@ -114,7 +132,7 @@ async def get_app_status_sub():
     while True:
         status = "online" if switch else "offline"
         app_list = [
-            # Specter is deactivated for now because it uses its own selfsigned HTTPS cert that makes trouble in chome on last test
+            # Specter is deactivated for now because it uses its own self signed HTTPS cert that makes trouble in Chrome on last test
             # also see: app/constants.py where specter is deactivated
             # {"id": "specter", "name": "Specter Desktop", "status": status},
             {"id": "sphinx", "name": "Sphinx Chat", "status": status},
@@ -132,10 +150,10 @@ async def install_app_sub(app_id: str):
     if not app_id in available_app_ids:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            detail=app_id + "install script not exist/supported",
+            detail=app_id + "install script does not exist / is not supported",
         )
 
-    await send_sse_message(
+    await broadcast_sse_msg(
         SSE.INSTALL_APP,
         {"id": app_id, "mode": "on", "result": "running", "details": ""},
     )
@@ -152,7 +170,7 @@ async def uninstall_app_sub(app_id: str, delete_data: bool):
             status.HTTP_400_BAD_REQUEST, detail="script not exist/supported"
         )
 
-    await send_sse_message(
+    await broadcast_sse_msg(
         SSE.INSTALL_APP,
         {"id": app_id, "mode": "off", "result": "running", "details": ""},
     )
@@ -168,7 +186,7 @@ async def uninstall_app_sub(app_id: str, delete_data: bool):
 
 async def run_bonus_script(app_id: str, params: str):
 
-    # to satisfy CodeQL: test again against pedefined array and dont use 'user value'
+    # to satisfy CodeQL: test again against predefined array and don't use 'user value'
     tested_app_id = ""
     for id in available_app_ids:
         if id == app_id:
@@ -201,7 +219,7 @@ async def run_bonus_script(app_id: str, params: str):
     logFileName = f"/var/cache/raspiblitz/temp/install.{app_id}.log"
     logging.info(f"WRITING LONG FILE: {logFileName}")
     with open(logFileName, "w", encoding="utf-8") as f:
-        f.write(f"API triggred script: {cmd}\n")
+        f.write(f"API triggered script: {cmd}\n")
         f.write(f"###### STDOUT #######\n")
         if stdout:
             f.write(stdout.decode())
@@ -217,7 +235,7 @@ async def run_bonus_script(app_id: str, params: str):
         # when there is a defined error message (if multiple it wil lbe the last one)
         if "error" in stdoutData:
             logging.error(f"FOUND `error=` returned by script: {stdoutData['error']}")
-            await send_sse_message(
+            await broadcast_sse_msg(
                 SSE.INSTALL_APP,
                 {
                     "id": app_id,
@@ -229,7 +247,7 @@ async def run_bonus_script(app_id: str, params: str):
         # when there is no result (e.g. result="OK") at the end of install script stdout - consider also script had error
         elif not "result" in stdoutData:
             logging.error(f"NO `result=` returned by script:")
-            await send_sse_message(
+            await broadcast_sse_msg(
                 SSE.INSTALL_APP,
                 {
                     "id": app_id,
@@ -248,7 +266,7 @@ async def run_bonus_script(app_id: str, params: str):
             if updatedAppData["error"] != "":
                 logging.warning(f"Error Detected ...")
                 logging.warning(f"updatedAppData: {updatedAppData}")
-                await send_sse_message(
+                await broadcast_sse_msg(
                     SSE.INSTALL_APP,
                     {
                         "id": app_id,
@@ -262,7 +280,7 @@ async def run_bonus_script(app_id: str, params: str):
             elif mode == "on":
                 if updatedAppData["installed"]:
                     logging.info(f"WIN - install was effective")
-                    await send_sse_message(
+                    await broadcast_sse_msg(
                         SSE.INSTALL_APP,
                         {
                             "id": app_id,
@@ -277,7 +295,7 @@ async def run_bonus_script(app_id: str, params: str):
                     logging.error(f"FAIL - was not installed")
                     logging.warning(f"DEBUG - updatedAppData: {updatedAppData}")
                     logging.warning(f"DEBUG - params: {params}")
-                    await send_sse_message(
+                    await broadcast_sse_msg(
                         SSE.INSTALL_APP,
                         {
                             "id": app_id,
@@ -294,7 +312,7 @@ async def run_bonus_script(app_id: str, params: str):
                     logging.error(f"FAIL - is still installed")
                     logging.warning(f"DEBUG - updatedAppData: {updatedAppData}")
                     logging.warning(f"DEBUG - params: {params}")
-                    await send_sse_message(
+                    await broadcast_sse_msg(
                         SSE.INSTALL_APP,
                         {
                             "id": app_id,
@@ -305,7 +323,7 @@ async def run_bonus_script(app_id: str, params: str):
                     )
                 else:
                     logging.info(f"WIN - uninstall was effective")
-                    await send_sse_message(
+                    await broadcast_sse_msg(
                         SSE.INSTALL_APP,
                         {
                             "id": app_id,
@@ -316,10 +334,10 @@ async def run_bonus_script(app_id: str, params: str):
                     )
 
             # send an updated state if that app
-            await send_sse_message(SSE.INSTALLED_APP_STATUS, [updatedAppData])
+            await broadcast_sse_msg(SSE.INSTALLED_APP_STATUS, [updatedAppData])
     else:
         logging.warning(f"Install Feedback Event: fail no stdout")
-        await send_sse_message(
+        await broadcast_sse_msg(
             SSE.INSTALL_APP,
             {"id": app_id, "mode": params, "result": "fail", "details": "no stdout"},
         )

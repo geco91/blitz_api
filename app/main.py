@@ -1,8 +1,7 @@
 import asyncio
-import json
 import logging
 
-from aioredis import Channel, Redis
+from decouple import config as dconfig
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import HTTPException
@@ -16,28 +15,33 @@ from starlette import status
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import RedirectResponse
 
+from app.auth.auth_bearer import JWTBearer
 from app.auth.auth_handler import (
     handle_local_cookie,
     register_cookie_updater,
     remove_local_cookie,
 )
 from app.external.fastapi_versioning import VersionedFastAPI
-from app.external.sse_starlette import EventSourceResponse
-from app.models.system import APIPlatform
+from app.models.api import ApiStartupStatus, StartupState
+from app.models.lightning import LnInitState
 from app.repositories.bitcoin import (
+    initialize_bitcoin_repo,
     register_bitcoin_status_gatherer,
     register_bitcoin_zmq_sub,
 )
-from app.repositories.lightning import (
-    listen_for_ssh_unlock,
-    register_lightning_listener,
-    register_wallet_unlock_listener,
-    unregister_wallet_unlock_listener,
+from app.repositories.lightning import initialize_ln_repo, register_lightning_listener
+from app.repositories.system import get_hardware_info, register_hardware_info_gatherer
+from app.repositories.utils import (
+    get_bitcoin_client_warmup_data,
+    get_full_client_warmup_data,
+    get_full_client_warmup_data_bitcoinonly,
 )
-from app.repositories.system import register_hardware_info_gatherer
-from app.repositories.utils import get_client_warmup_data
 from app.routers import apps, bitcoin, lightning, setup, system
-from app.utils import SSE, redis_get, send_sse_message
+from app.utils import SSE, broadcast_sse_msg, build_sse_event, sse_mgr
+
+logging.basicConfig(level=logging.WARNING)
+
+node_type = dconfig("ln_node")
 
 
 @registered_configuration
@@ -50,7 +54,8 @@ config = get_config()
 
 unversioned_app.include_router(apps.router)
 unversioned_app.include_router(bitcoin.router)
-unversioned_app.include_router(lightning.router)
+if node_type != "none":
+    unversioned_app.include_router(lightning.router)
 unversioned_app.include_router(system.router)
 unversioned_app.include_router(setup.router)
 
@@ -80,9 +85,104 @@ app.add_middleware(
 async def on_startup():
     await redis_plugin.init_app(app, config=config)
     await redis_plugin.init()
-    await check_defer_register_handlers()
-    handle_local_cookie()
     register_cookie_updater()
+    await broadcast_sse_msg(SSE.SYSTEM_STARTUP_INFO, api_startup_status.dict())
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(_initialize_bitcoin())
+    loop.create_task(_initialize_lightning())
+
+    await register_all_handlers()
+    handle_local_cookie()
+
+
+api_startup_status = ApiStartupStatus()
+
+
+async def _set_startup_status(
+    bitcoin: StartupState = None,
+    bitcoin_msg: str = None,
+    lightning: StartupState = None,
+    lightning_msg: str = None,
+):
+    # We must know when both bitcoin and lightning are initialized
+    # to trigger the warmup method for new SSE clients
+    if bitcoin is not None:
+        api_startup_status.bitcoin = bitcoin
+    if bitcoin_msg is not None:
+        api_startup_status.bitcoin_msg = bitcoin_msg
+    if lightning is not None:
+        api_startup_status.lightning = lightning
+    if lightning_msg is not None:
+        api_startup_status.lightning_msg = lightning_msg
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(warmup_new_connections())
+    await broadcast_sse_msg(SSE.SYSTEM_STARTUP_INFO, api_startup_status.dict())
+
+
+async def _initialize_bitcoin():
+    await _set_startup_status(bitcoin=StartupState.OFFLINE)
+    await initialize_bitcoin_repo()
+    await register_bitcoin_zmq_sub()
+    await register_bitcoin_status_gatherer()
+    await _set_startup_status(bitcoin=StartupState.DONE)
+
+
+async def _initialize_lightning():
+    if node_type == "none" or node_type == "":
+        api_startup_status.lightning = StartupState.DISABLED
+        api_startup_status.lightning_msg = ""
+        await _set_startup_status(lightning=StartupState.DISABLED)
+        logging.info("Lightning node is disabled, skipping initialization")
+        return
+
+    try:
+        async for u in initialize_ln_repo():
+            ln_status = None
+            ln_msg = None
+            changed = False
+            if (
+                u.state == LnInitState.OFFLINE
+                and api_startup_status.lightning != StartupState.OFFLINE
+            ):
+                ln_status = StartupState.OFFLINE
+                changed = True
+            elif (
+                u.state == LnInitState.BOOTSTRAPPING
+                and api_startup_status.lightning != StartupState.BOOTSTRAPPING
+            ):
+                ln_status = StartupState.BOOTSTRAPPING
+                changed = True
+            elif (
+                u.state == LnInitState.LOCKED
+                and api_startup_status.lightning != StartupState.LOCKED
+            ):
+                ln_status = StartupState.LOCKED
+                changed = True
+            elif (
+                u.state == LnInitState.DONE
+                and api_startup_status.lightning != StartupState.DONE
+            ):
+                # We've successfully connected to the lightning node
+                # We can now register all lightning listeners
+                await register_lightning_listener()
+                ln_status = StartupState.DONE
+                ln_msg = ""
+                changed = True
+
+            if api_startup_status.lightning_msg != u.msg:
+                ln_msg = u.msg
+                changed = True
+
+            if changed:
+                await _set_startup_status(lightning=ln_status, lightning_msg=ln_msg)
+
+    except HTTPException as r:
+        logging.error(f"Exception {r.detail}.")
+        raise
+    except NotImplementedError as r:
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, detail=r.args[0])
 
 
 @app.on_event("shutdown")
@@ -99,165 +199,142 @@ def index(req: Request):
     )
 
 
-num_connections = 0
-connections = {}
 new_connections = []
-wallet_locked = True
+
+
+def _send_sse_event(id, event, data):
+    return sse_mgr.send_to_single(id, build_sse_event(event, data))
 
 
 @app.get("/sse/subscribe", status_code=status.HTTP_200_OK)
 async def stream(request: Request):
+    token = request.cookies.get("access_token")
+    if not token:
+        # No token in cookies found, try to get it from the Authorization header
+        token = request.headers.get("authorization")
 
-    global wallet_locked
-    global num_connections
-    q = asyncio.Queue()
-    connections[num_connections] = q
-    num_connections += 1
-    new_connections.append(q)
+    if not token:
+        # Raise an exception as there is not token found
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No authorization code.",
+        )
 
-    if wallet_locked:
-        # send the the wallet locked event to the new connection
-        await q.put(_make_evt_data(SSE.WALLET_LOCK_STATUS, {"locked": True}))
-    else:
-        await q.put(_make_evt_data(SSE.WALLET_LOCK_STATUS, {"locked": False}))
+    token = token.replace("Bearer ", "")
+    if not JWTBearer().verify_jwt(jwtoken=token):
+        # token is invalid
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization code.",
+        )
 
-    if not wallet_locked and len(new_connections) == 1:
-        # if the wallet is locked, we'll handle the warmup in _handle_ln_wallet_locked()
-        loop = asyncio.get_event_loop()
-        loop.create_task(warmup_new_connections())
+    event_source, id = sse_mgr.add_connection(request)
+    new_connections.append(id)
 
-    return EventSourceResponse(subscribe(request, num_connections - 1, q))
+    await _send_sse_event(
+        id, SSE.SYSTEM_STARTUP_INFO, jsonable_encoder(api_startup_status.dict())
+    )
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(warmup_new_connections())
+
+    return event_source
+
+
+warmup_running = False
 
 
 async def warmup_new_connections():
+    # This doesn't keep track of which connection has received
+    # which data already, so it may send data twice data to the client
+    # when the startup state changes. Especially the hardware info
+    # is rather data intensive. This is OK for now, to keep the code simple.
+
     global new_connections
+    if len(new_connections) == 0:
+        return
 
-    res = await get_client_warmup_data()
+    global warmup_running
+    if warmup_running:
+        logging.debug("Warmup already running, skipping")
+        return
 
-    for c in new_connections:
-        await asyncio.gather(
-            *[
-                c.put(_make_evt_data(SSE.SYSTEM_INFO, res[0].dict())),
-                c.put(_make_evt_data(SSE.BTC_INFO, res[1].dict())),
-                c.put(_make_evt_data(SSE.LN_INFO, res[2].dict())),
-                c.put(_make_evt_data(SSE.LN_INFO_LITE, res[3].dict())),
-                c.put(_make_evt_data(SSE.LN_FEE_REVENUE, res[4])),
-                c.put(_make_evt_data(SSE.WALLET_BALANCE, res[5].dict())),
-                c.put(_make_evt_data(SSE.INSTALLED_APP_STATUS, res[6])),
-            ]
-        )
+    warmup_running = True
+    is_ready = api_startup_status.is_fully_initialized()
 
-    new_connections.clear()
+    if is_ready:
 
+        # when lightning is active
+        if node_type != "" and node_type != "none":
 
-def _make_evt_data(evt: SSE, data):
-    d1 = {"event": evt, "data": json.dumps(jsonable_encoder(data))}
-    # d2 = {"event": evt, "data": jsonable_encoder(data)}
-    return d1
+            res = await get_full_client_warmup_data()
+            for id in new_connections:
+                await asyncio.gather(
+                    *[
+                        _send_sse_event(id, SSE.SYSTEM_INFO, res[0].dict()),
+                        _send_sse_event(id, SSE.BTC_INFO, res[1].dict()),
+                        _send_sse_event(id, SSE.LN_INFO, res[2].dict()),
+                        _send_sse_event(id, SSE.LN_INFO_LITE, res[3].dict()),
+                        _send_sse_event(id, SSE.LN_FEE_REVENUE, res[4]),
+                        _send_sse_event(id, SSE.WALLET_BALANCE, res[5].dict()),
+                        _send_sse_event(id, SSE.INSTALLED_APP_STATUS, res[6]),
+                        _send_sse_event(id, SSE.HARDWARE_INFO, res[7]),
+                    ]
+                )
 
+        # when its bitcoin only
+        else:
 
-async def subscribe(request: Request, id: int, q: asyncio.Queue):
-    try:
-        while True:
-            if await request.is_disconnected():
-                connections.pop(id)
-                await request.close()
-                break
-            else:
-                data = jsonable_encoder(await q.get())
-                yield data
-    except asyncio.CancelledError as e:
-        connections.pop(id)
-        await request.close()
+            res = await get_full_client_warmup_data_bitcoinonly()
+            for id in new_connections:
+                await asyncio.gather(
+                    *[
+                        _send_sse_event(id, SSE.SYSTEM_INFO, res[0].dict()),
+                        _send_sse_event(id, SSE.BTC_INFO, res[1].dict()),
+                        _send_sse_event(id, SSE.HARDWARE_INFO, res[2]),
+                    ]
+                )
+
+        new_connections.clear()
+
+    if (
+        api_startup_status.bitcoin == StartupState.DONE
+        and api_startup_status.lightning != StartupState.DONE
+    ):
+        res = await get_bitcoin_client_warmup_data()
+        for id in new_connections:
+            await asyncio.gather(
+                *[
+                    _send_sse_event(id, SSE.BTC_INFO, res[0].dict()),
+                    _send_sse_event(id, SSE.HARDWARE_INFO, res[1]),
+                ]
+            )
+
+        # don't clear new_connections, we'll try again later when api is initialized
+
+    if (
+        api_startup_status.bitcoin != StartupState.DONE
+        and api_startup_status.lightning != StartupState.DONE
+    ):
+        # send only the most minimal available data without Bitcoin Core and Lightning running
+        res = await get_hardware_info()
+        for id in new_connections:
+            await _send_sse_event(id, SSE.HARDWARE_INFO, res),
+
+        # don't clear new_connections, we'll try again later when api is initialized
+
+    warmup_running = False
 
 
 register_handlers_finished = False
 
 
-async def check_defer_register_handlers():
-    """
-    Special case for RaspiBlitz: Depending on the current setup step
-    there still isn't a Bitcoin Deamon or Lightning Node running.
-    We must defer the registration of all those handlers until later
-    when everything is properly setup.
-
-    Since there is a final reboot after the setup there is no need to
-    check in the background whether setup is finished. The API server
-    is restartet anyway.
-    """
-
-    platform = APIPlatform.get_current()
-    if platform != APIPlatform.RASPIBLITZ:
-        # Handle everything BUT RaspiBlitz normally
-        await register_all_handlers(redis_plugin.redis)
-    else:
-        # Handle Raspiblitz
-        setup_phase = await redis_get("setupPhase")
-
-        if setup_phase == "done":
-            await register_all_handlers(redis_plugin.redis)
-        else:
-            logging.warning(
-                f"Setup not finished. Defering handler startup. Current phase: '{setup_phase}'"
-            )
-
-
-async def register_all_handlers(redis: Redis):
+async def register_all_handlers():
     global register_handlers_finished
-    global wallet_locked
 
     if register_handlers_finished:
         raise RuntimeError("register_all_handlers() must not be called twice.")
 
-    try:
-        await register_bitcoin_zmq_sub()
-        await register_bitcoin_status_gatherer()
-        await register_hardware_info_gatherer()
-        await register_lightning_listener()
-        wallet_locked = False
-    except HTTPException as r:
-        if r.status_code == status.HTTP_423_LOCKED:
-            # When the node is locked we must call register_lightning_listener
-            # again when the user unlocks the wallet.
-            print("Wallet is locked... waiting for unlock.")
-            loop = asyncio.get_event_loop()
-            loop.create_task(_handle_ln_wallet_locked())
-        else:
-            raise
-    except NotImplementedError as r:
-        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, detail=r.args[0])
+    await register_hardware_info_gatherer()
 
-    (sub,) = await redis.subscribe(channel=Channel("default", False))
-    loop = asyncio.get_event_loop()
-    loop.create_task(broadcast_data_sse(sub))
     register_handlers_finished = True
-
-
-async def broadcast_data_sse(sub):
-    while await sub.wait_message():
-        data = json.loads(await sub.get(encoding="utf-8"))
-        for k in connections.keys():
-            if connections.get(k):
-                await connections.get(k).put(data)
-
-
-async def _handle_ln_wallet_locked():
-    global wallet_locked
-    q = asyncio.Queue()
-    register_wallet_unlock_listener(q)
-    listen_for_ssh_unlock()
-    await q.get()
-    # Give the node a few seconds to fully start up
-    await asyncio.sleep(5)
-    print("Wallet was unlocked.")
-    await register_lightning_listener()
-    wallet_locked = False
-    unregister_wallet_unlock_listener(q)
-
-    # send a wallet unlocked message to all connections before
-    # sending the warmup messages
-    await send_sse_message(SSE.WALLET_LOCK_STATUS, {"locked": False})
-
-    # send the connection warmup messages
-    loop = asyncio.get_event_loop()
-    loop.create_task(warmup_new_connections())
